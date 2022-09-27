@@ -167,11 +167,11 @@ func (q *querier) Select(sortSeries bool, hints *storage.SelectHints, matchers .
 		return storage.ErrSeriesSet(fmt.Errorf("toQuery: %w", err))
 	}
 
-	res, err := q.client.Read(q.ctx, query)
+	res, err := q.client.Read(q.ctx, query, sortSeries)
 	if err != nil {
 		return storage.ErrSeriesSet(fmt.Errorf("remote_read: %w", err))
 	}
-	return newSeriesSetFilter(FromQueryResult(sortSeries, res), added)
+	return newSeriesSetFilter(res, added)
 }
 
 // addExternalLabels adds matchers for each external label. External labels

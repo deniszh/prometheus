@@ -14,6 +14,7 @@
 package remote
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -24,7 +25,6 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 	"github.com/prometheus/common/model"
-
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/textparse"
@@ -388,6 +388,170 @@ func (c *concreteSeriesIterator) Next() bool {
 // Err implements storage.SeriesIterator.
 func (c *concreteSeriesIterator) Err() error {
 	return nil
+}
+
+// chunkedSeriesSet implements storage.SeriesSet
+type chunkedSeriesSet struct {
+	chunkedReader *ChunkedReader
+	respBody      io.ReadCloser
+	cancel        context.CancelFunc
+
+	current storage.Series
+	err     error
+}
+
+func NewChunkedSeriesSet(chunkedReader *ChunkedReader, respBody io.ReadCloser, cancel context.CancelFunc) storage.SeriesSet {
+	return &chunkedSeriesSet{
+		chunkedReader: chunkedReader,
+		respBody:      respBody,
+		cancel:        cancel,
+	}
+}
+
+// Next return true if there is a next series and false otherwise. It will
+// block until the next series is available.
+func (s *chunkedSeriesSet) Next() bool {
+	res := &prompb.ChunkedReadResponse{}
+
+	err := s.chunkedReader.NextProto(res)
+	if err != nil {
+		if err != io.EOF {
+			s.err = err
+			_, _ = io.Copy(io.Discard, s.respBody)
+		}
+
+		_ = s.respBody.Close()
+		s.cancel()
+
+		return false
+	}
+
+	s.current = &chunkedSeries{
+		labels: res.ChunkedSeries[0].Labels,
+		chunks: res.ChunkedSeries[0].Chunks,
+	}
+
+	return true
+}
+
+func (s *chunkedSeriesSet) At() storage.Series {
+	return s.current
+}
+
+func (s *chunkedSeriesSet) Err() error {
+	return s.err
+}
+
+func (s *chunkedSeriesSet) Warnings() storage.Warnings {
+	return nil
+}
+
+// chunkedSeries implements storage.Series
+type chunkedSeries struct {
+	labels []prompb.Label
+	chunks []prompb.Chunk
+}
+
+func (s *chunkedSeries) Labels() labels.Labels {
+	return labelProtosToLabels(s.labels)
+}
+
+func (s *chunkedSeries) Iterator() chunkenc.Iterator {
+	return newChunkedSeriesIterator(s.chunks)
+}
+
+// chunkedSeriesIterator implements chunkenc.Iterator
+type chunkedSeriesIterator struct {
+	chunks []prompb.Chunk
+	idx    int
+
+	cur chunkenc.Iterator
+
+	err error
+}
+
+func newChunkedSeriesIterator(chunks []prompb.Chunk) *chunkedSeriesIterator {
+	it := &chunkedSeriesIterator{chunks: chunks, idx: 0}
+	if len(chunks) > 0 {
+		it.resetIterator()
+	}
+
+	return it
+}
+
+func (it *chunkedSeriesIterator) Next() bool {
+	if it.err != nil {
+		return false
+	}
+	if len(it.chunks) == 0 {
+		return false
+	}
+
+	if it.cur.Next() {
+		return true
+	}
+	if it.idx >= len(it.chunks)-1 {
+		return false
+	}
+
+	it.idx++
+	it.resetIterator()
+	return it.Next()
+}
+
+func (it *chunkedSeriesIterator) Seek(t int64) bool {
+	if it.err != nil {
+		return false
+	}
+	if len(it.chunks) == 0 {
+		return false
+	}
+
+	startIdx := it.idx
+	it.idx += sort.Search(len(it.chunks)-startIdx, func(i int) bool {
+		return it.chunks[startIdx+i].MaxTimeMs >= t
+	})
+	if it.idx > startIdx {
+		it.resetIterator()
+	} else {
+		ts, _ := it.cur.At()
+		if ts >= t {
+			return true
+		}
+	}
+
+	for it.cur.Next() {
+		ts, _ := it.cur.At()
+		if ts >= t {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (it *chunkedSeriesIterator) resetIterator() {
+	if it.idx < len(it.chunks) {
+		chunk := it.chunks[it.idx]
+
+		decodedChunk, err := chunkenc.FromData(chunkenc.Encoding(chunk.Type), chunk.Data)
+		if err != nil {
+			it.err = err
+			return
+		}
+
+		it.cur = decodedChunk.Iterator(nil)
+	} else {
+		it.cur = chunkenc.NewNopIterator()
+	}
+}
+
+func (it *chunkedSeriesIterator) At() (ts int64, v float64) {
+	return it.cur.At()
+}
+
+func (it *chunkedSeriesIterator) Err() error {
+	return it.err
 }
 
 // validateLabelsAndMetricName validates the label names/values and metric names returned from remote read,

@@ -196,7 +196,7 @@ type mockedRemoteClient struct {
 	store []*prompb.TimeSeries
 }
 
-func (c *mockedRemoteClient) Read(_ context.Context, query *prompb.Query) (*prompb.QueryResult, error) {
+func (c *mockedRemoteClient) Read(_ context.Context, query *prompb.Query, sortSeries bool) (storage.SeriesSet, error) {
 	if c.got != nil {
 		return nil, fmt.Errorf("expected only one call to remote client got: %v", query)
 	}
@@ -225,7 +225,7 @@ func (c *mockedRemoteClient) Read(_ context.Context, query *prompb.Query) (*prom
 			q.Timeseries = append(q.Timeseries, &prompb.TimeSeries{Labels: s.Labels})
 		}
 	}
-	return q, nil
+	return FromQueryResult(sortSeries, q), nil
 }
 
 func (c *mockedRemoteClient) reset() {
