@@ -182,7 +182,7 @@ func TestStreamReadEndpoint(t *testing.T) {
 	require.Equal(t, "", recorder.Result().Header.Get("Content-Encoding"))
 
 	var results []*prompb.ChunkedReadResponse
-	stream := NewChunkedReader(recorder.Result().Body, DefaultChunkedReadLimit, nil)
+	stream := NewChunkedReader(recorder.Result().Body, config.DefaultChunkedReadLimit, nil)
 	for {
 		res := &prompb.ChunkedReadResponse{}
 		err := stream.NextProto(res)

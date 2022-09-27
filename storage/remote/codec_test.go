@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/gogo/protobuf/proto"
+	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/stretchr/testify/require"
 
@@ -491,7 +492,7 @@ func TestChunkedSeriesSet(t *testing.T) {
 		flusher := &mockFlusher{}
 
 		w := NewChunkedWriter(buf, flusher)
-		r := NewChunkedReader(buf, DefaultChunkedReadLimit, nil)
+		r := NewChunkedReader(buf, config.DefaultChunkedReadLimit, nil)
 
 		chunks := buildTestChunks(t)
 		l := []prompb.Label{
@@ -544,7 +545,7 @@ func TestChunkedSeriesSet(t *testing.T) {
 		flusher := &mockFlusher{}
 
 		w := NewChunkedWriter(buf, flusher)
-		r := NewChunkedReader(buf, DefaultChunkedReadLimit, nil)
+		r := NewChunkedReader(buf, config.DefaultChunkedReadLimit, nil)
 
 		chunks := buildTestChunks(t)
 		l := []prompb.Label{

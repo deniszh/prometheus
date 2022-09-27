@@ -27,6 +27,7 @@ import (
 	"github.com/golang/snappy"
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/stretchr/testify/require"
 )
@@ -284,7 +285,7 @@ func TestReadClient(t *testing.T) {
 			conf := &ClientConfig{
 				URL:              &config_util.URL{URL: u},
 				Timeout:          model.Duration(5 * time.Second),
-				RetryOnRateLimit: false,
+				ChunkedReadLimit: config.DefaultChunkedReadLimit,
 			}
 			c, err := NewReadClient("test", conf)
 			require.NoError(t, err)

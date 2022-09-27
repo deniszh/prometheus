@@ -40,8 +40,7 @@ import (
 )
 
 const (
-	maxErrMsgLen   = 1024
-	initialBufSize = 32 * 1024 // 32KB
+	maxErrMsgLen = 1024
 )
 
 var (
@@ -96,6 +95,7 @@ type Client struct {
 	timeout    time.Duration
 
 	retryOnRateLimit bool
+	chunkedReadLimit uint64
 
 	readQueries         prometheus.Gauge
 	readQueriesTotal    *prometheus.CounterVec
@@ -110,6 +110,7 @@ type ClientConfig struct {
 	SigV4Config      *sigv4.SigV4Config
 	Headers          map[string]string
 	RetryOnRateLimit bool
+	ChunkedReadLimit uint64
 }
 
 // ReadClient will request the STREAMED_XOR_CHUNKS method of remote read but can
@@ -136,6 +137,7 @@ func NewReadClient(name string, conf *ClientConfig) (ReadClient, error) {
 		url:                 conf.URL,
 		Client:              httpClient,
 		timeout:             time.Duration(conf.Timeout),
+		chunkedReadLimit:    conf.ChunkedReadLimit,
 		readQueries:         remoteReadQueries.WithLabelValues(name, conf.URL.String()),
 		readQueriesTotal:    remoteReadQueriesTotal.MustCurryWith(prometheus.Labels{remoteName: name, endpoint: conf.URL.String()}),
 		readQueriesDuration: remoteReadQueryDuration.MustCurryWith(prometheus.Labels{remoteName: name, endpoint: conf.URL.String()}),
@@ -375,7 +377,6 @@ func (c *Client) handleSampledResponse(req *prompb.ReadRequest, httpResp *http.R
 }
 
 func (c *Client) handleChunkedResponse(httpResp *http.Response, cancel context.CancelFunc) storage.SeriesSet {
-	// TODO: Make this size limit configurable
-	s := NewChunkedReader(httpResp.Body, DefaultChunkedReadLimit, nil)
+	s := NewChunkedReader(httpResp.Body, c.chunkedReadLimit, nil)
 	return NewChunkedSeriesSet(s, httpResp.Body, cancel)
 }
