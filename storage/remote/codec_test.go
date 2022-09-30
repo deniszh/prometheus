@@ -20,9 +20,10 @@ import (
 	"testing"
 
 	"github.com/gogo/protobuf/proto"
+	"github.com/stretchr/testify/require"
+
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
-	"github.com/stretchr/testify/require"
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/textparse"

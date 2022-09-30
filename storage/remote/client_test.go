@@ -27,9 +27,10 @@ import (
 	"github.com/golang/snappy"
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	"github.com/stretchr/testify/require"
+
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/prompb"
-	"github.com/stretchr/testify/require"
 )
 
 var longErrMessage = strings.Repeat("error message", maxErrMsgLen)

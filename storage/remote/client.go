@@ -31,10 +31,11 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/sigv4"
 	"github.com/prometheus/common/version"
-	"github.com/prometheus/prometheus/storage"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/prometheus/prometheus/storage"
 
 	"github.com/prometheus/prometheus/prompb"
 )
