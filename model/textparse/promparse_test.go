@@ -192,7 +192,6 @@ testmetric{label="\"bar\""} 1`
 			require.Equal(t, exp[i].t, ts)
 			require.Equal(t, exp[i].v, v)
 			require.Equal(t, exp[i].lset, res)
-			res = res[:0]
 
 		case EntryType:
 			m, typ := p.Type()
@@ -220,7 +219,7 @@ func TestPromParseErrors(t *testing.T) {
 	}{
 		{
 			input: "a",
-			err:   "expected value after metric, got \"MNAME\"",
+			err:   "expected value after metric, got \"INVALID\"",
 		},
 		{
 			input: "a{b='c'} 1\n",
@@ -264,7 +263,7 @@ func TestPromParseErrors(t *testing.T) {
 		},
 		{
 			input: "foo 0 1_2\n",
-			err:   "expected next entry after timestamp, got \"MNAME\"",
+			err:   "expected next entry after timestamp, got \"INVALID\"",
 		},
 		{
 			input: `{a="ok"} 1`,
@@ -326,7 +325,11 @@ func TestPromNullByteHandling(t *testing.T) {
 		},
 		{
 			input: "a\x00{b=\"ddd\"} 1",
-			err:   "expected value after metric, got \"MNAME\"",
+			err:   "expected value after metric, got \"INVALID\"",
+		},
+		{
+			input: "a 0 1\x00",
+			err:   "expected next entry after timestamp, got \"INVALID\"",
 		},
 	}
 
@@ -367,7 +370,7 @@ func BenchmarkParse(b *testing.B) {
 			b.Run(parserName+"/no-decode-metric/"+fn, func(b *testing.B) {
 				total := 0
 
-				b.SetBytes(int64(len(buf) * (b.N / promtestdataSampleCount)))
+				b.SetBytes(int64(len(buf) / promtestdataSampleCount))
 				b.ReportAllocs()
 				b.ResetTimer()
 
@@ -395,7 +398,7 @@ func BenchmarkParse(b *testing.B) {
 			b.Run(parserName+"/decode-metric/"+fn, func(b *testing.B) {
 				total := 0
 
-				b.SetBytes(int64(len(buf) * (b.N / promtestdataSampleCount)))
+				b.SetBytes(int64(len(buf) / promtestdataSampleCount))
 				b.ReportAllocs()
 				b.ResetTimer()
 
@@ -414,7 +417,7 @@ func BenchmarkParse(b *testing.B) {
 						case EntrySeries:
 							m, _, _ := p.Series()
 
-							res := make(labels.Labels, 0, 5)
+							var res labels.Labels
 							p.Metric(&res)
 
 							total += len(m)
@@ -426,9 +429,9 @@ func BenchmarkParse(b *testing.B) {
 			})
 			b.Run(parserName+"/decode-metric-reuse/"+fn, func(b *testing.B) {
 				total := 0
-				res := make(labels.Labels, 0, 5)
+				var res labels.Labels
 
-				b.SetBytes(int64(len(buf) * (b.N / promtestdataSampleCount)))
+				b.SetBytes(int64(len(buf) / promtestdataSampleCount))
 				b.ReportAllocs()
 				b.ResetTimer()
 
@@ -451,14 +454,16 @@ func BenchmarkParse(b *testing.B) {
 
 							total += len(m)
 							i++
-							res = res[:0]
 						}
 					}
 				}
 				_ = total
 			})
 			b.Run("expfmt-text/"+fn, func(b *testing.B) {
-				b.SetBytes(int64(len(buf) * (b.N / promtestdataSampleCount)))
+				if parserName != "prometheus" {
+					b.Skip()
+				}
+				b.SetBytes(int64(len(buf) / promtestdataSampleCount))
 				b.ReportAllocs()
 				b.ResetTimer()
 
@@ -507,7 +512,7 @@ func BenchmarkGzip(b *testing.B) {
 			k := b.N / promtestdataSampleCount
 
 			b.ReportAllocs()
-			b.SetBytes(int64(k) * int64(n))
+			b.SetBytes(int64(n) / promtestdataSampleCount)
 			b.ResetTimer()
 
 			total := 0

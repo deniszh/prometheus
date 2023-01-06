@@ -47,6 +47,7 @@ import (
 	"github.com/prometheus/prometheus/discovery/moby"
 	"github.com/prometheus/prometheus/discovery/nomad"
 	"github.com/prometheus/prometheus/discovery/openstack"
+	"github.com/prometheus/prometheus/discovery/ovhcloud"
 	"github.com/prometheus/prometheus/discovery/puppetdb"
 	"github.com/prometheus/prometheus/discovery/scaleway"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
@@ -218,25 +219,44 @@ var expectedConf = &Config{
 					Regex:        relabel.MustNewRegexp("(.*)some-[regex]"),
 					Replacement:  "foo-${1}",
 					Action:       relabel.Replace,
-				}, {
+				},
+				{
 					SourceLabels: model.LabelNames{"abc"},
 					TargetLabel:  "cde",
 					Separator:    ";",
 					Regex:        relabel.DefaultRelabelConfig.Regex,
 					Replacement:  relabel.DefaultRelabelConfig.Replacement,
 					Action:       relabel.Replace,
-				}, {
+				},
+				{
 					TargetLabel: "abc",
 					Separator:   ";",
 					Regex:       relabel.DefaultRelabelConfig.Regex,
 					Replacement: "static",
 					Action:      relabel.Replace,
-				}, {
+				},
+				{
 					TargetLabel: "abc",
 					Separator:   ";",
 					Regex:       relabel.MustNewRegexp(""),
 					Replacement: "static",
 					Action:      relabel.Replace,
+				},
+				{
+					SourceLabels: model.LabelNames{"foo"},
+					TargetLabel:  "abc",
+					Action:       relabel.KeepEqual,
+					Regex:        relabel.DefaultRelabelConfig.Regex,
+					Replacement:  relabel.DefaultRelabelConfig.Replacement,
+					Separator:    relabel.DefaultRelabelConfig.Separator,
+				},
+				{
+					SourceLabels: model.LabelNames{"foo"},
+					TargetLabel:  "abc",
+					Action:       relabel.DropEqual,
+					Regex:        relabel.DefaultRelabelConfig.Regex,
+					Replacement:  relabel.DefaultRelabelConfig.Replacement,
+					Separator:    relabel.DefaultRelabelConfig.Separator,
 				},
 			},
 		},
@@ -568,6 +588,7 @@ var expectedConf = &Config{
 							Values: []string{"web", "db"},
 						},
 					},
+					HTTPClientConfig: config.DefaultHTTPClientConfig,
 				},
 			},
 		},
@@ -584,12 +605,13 @@ var expectedConf = &Config{
 
 			ServiceDiscoveryConfigs: discovery.Configs{
 				&aws.LightsailSDConfig{
-					Region:          "us-east-1",
-					AccessKey:       "access",
-					SecretKey:       "mysecret",
-					Profile:         "profile",
-					RefreshInterval: model.Duration(60 * time.Second),
-					Port:            80,
+					Region:           "us-east-1",
+					AccessKey:        "access",
+					SecretKey:        "mysecret",
+					Profile:          "profile",
+					RefreshInterval:  model.Duration(60 * time.Second),
+					Port:             80,
+					HTTPClientConfig: config.DefaultHTTPClientConfig,
 				},
 			},
 		},
@@ -943,6 +965,35 @@ var expectedConf = &Config{
 			},
 		},
 		{
+			JobName: "ovhcloud",
+
+			HonorTimestamps:  true,
+			ScrapeInterval:   model.Duration(15 * time.Second),
+			ScrapeTimeout:    DefaultGlobalConfig.ScrapeTimeout,
+			HTTPClientConfig: config.DefaultHTTPClientConfig,
+			MetricsPath:      DefaultScrapeConfig.MetricsPath,
+			Scheme:           DefaultScrapeConfig.Scheme,
+
+			ServiceDiscoveryConfigs: discovery.Configs{
+				&ovhcloud.SDConfig{
+					Endpoint:          "ovh-eu",
+					ApplicationKey:    "testAppKey",
+					ApplicationSecret: "testAppSecret",
+					ConsumerKey:       "testConsumerKey",
+					RefreshInterval:   model.Duration(60 * time.Second),
+					Service:           "vps",
+				},
+				&ovhcloud.SDConfig{
+					Endpoint:          "ovh-eu",
+					ApplicationKey:    "testAppKey",
+					ApplicationSecret: "testAppSecret",
+					ConsumerKey:       "testConsumerKey",
+					RefreshInterval:   model.Duration(60 * time.Second),
+					Service:           "dedicated_server",
+				},
+			},
+		},
+		{
 			JobName: "scaleway",
 
 			HonorTimestamps:  true,
@@ -1177,7 +1228,7 @@ func TestElideSecrets(t *testing.T) {
 	yamlConfig := string(config)
 
 	matches := secretRe.FindAllStringIndex(yamlConfig, -1)
-	require.Equal(t, 18, len(matches), "wrong number of secret matches found")
+	require.Equal(t, 22, len(matches), "wrong number of secret matches found")
 	require.NotContains(t, yamlConfig, "mysecret",
 		"yaml marshal reveals authentication credentials.")
 }
@@ -1287,6 +1338,22 @@ var expectedErrors = []struct {
 	{
 		filename: "labeldrop5.bad.yml",
 		errMsg:   "labeldrop action requires only 'regex', and no other fields",
+	},
+	{
+		filename: "dropequal.bad.yml",
+		errMsg:   "relabel configuration for dropequal action requires 'target_label' value",
+	},
+	{
+		filename: "dropequal1.bad.yml",
+		errMsg:   "dropequal action requires only 'source_labels' and `target_label`, and no other fields",
+	},
+	{
+		filename: "keepequal.bad.yml",
+		errMsg:   "relabel configuration for keepequal action requires 'target_label' value",
+	},
+	{
+		filename: "keepequal1.bad.yml",
+		errMsg:   "keepequal action requires only 'source_labels' and `target_label`, and no other fields",
 	},
 	{
 		filename: "labelmap.bad.yml",
@@ -1620,6 +1687,14 @@ var expectedErrors = []struct {
 		filename: "ionos_datacenter.bad.yml",
 		errMsg:   "datacenter id can't be empty",
 	},
+	{
+		filename: "ovhcloud_no_secret.bad.yml",
+		errMsg:   "application secret can not be empty",
+	},
+	{
+		filename: "ovhcloud_bad_service.bad.yml",
+		errMsg:   "unknown service: fakeservice",
+	},
 }
 
 func TestBadConfigs(t *testing.T) {
@@ -1670,6 +1745,33 @@ func TestExpandExternalLabels(t *testing.T) {
 	c, err = LoadFile("testdata/external_labels.good.yml", false, true, log.NewNopLogger())
 	require.NoError(t, err)
 	require.Equal(t, labels.FromStrings("bar", "foo", "baz", "fooTestValuebar", "foo", "TestValue", "qux", "foo${TEST}", "xyz", "foo$bar"), c.GlobalConfig.ExternalLabels)
+}
+
+func TestAgentMode(t *testing.T) {
+	_, err := LoadFile("testdata/agent_mode.with_alert_manager.yml", true, false, log.NewNopLogger())
+	require.ErrorContains(t, err, "field alerting is not allowed in agent mode")
+
+	_, err = LoadFile("testdata/agent_mode.with_alert_relabels.yml", true, false, log.NewNopLogger())
+	require.ErrorContains(t, err, "field alerting is not allowed in agent mode")
+
+	_, err = LoadFile("testdata/agent_mode.with_rule_files.yml", true, false, log.NewNopLogger())
+	require.ErrorContains(t, err, "field rule_files is not allowed in agent mode")
+
+	_, err = LoadFile("testdata/agent_mode.with_remote_reads.yml", true, false, log.NewNopLogger())
+	require.ErrorContains(t, err, "field remote_read is not allowed in agent mode")
+
+	c, err := LoadFile("testdata/agent_mode.without_remote_writes.yml", true, false, log.NewNopLogger())
+	require.NoError(t, err)
+	require.Len(t, c.RemoteWriteConfigs, 0)
+
+	c, err = LoadFile("testdata/agent_mode.good.yml", true, false, log.NewNopLogger())
+	require.NoError(t, err)
+	require.Len(t, c.RemoteWriteConfigs, 1)
+	require.Equal(
+		t,
+		"http://remote1/push",
+		c.RemoteWriteConfigs[0].URL.String(),
+	)
 }
 
 func TestEmptyGlobalBlock(t *testing.T) {

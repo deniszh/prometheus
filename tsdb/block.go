@@ -80,10 +80,10 @@ type IndexReader interface {
 	// by the label set of the underlying series.
 	SortedPostings(index.Postings) index.Postings
 
-	// Series populates the given labels and chunk metas for the series identified
+	// Series populates the given builder and chunk metas for the series identified
 	// by the reference.
 	// Returns storage.ErrNotFound if the ref does not resolve to a known series.
-	Series(ref storage.SeriesRef, lset *labels.Labels, chks *[]chunks.Meta) error
+	Series(ref storage.SeriesRef, builder *labels.ScratchBuilder, chks *[]chunks.Meta) error
 
 	// LabelNames returns all the unique label names present in the index in sorted order.
 	LabelNames(matchers ...*labels.Matcher) ([]string, error)
@@ -199,7 +199,7 @@ func (bm *BlockMetaCompaction) SetOutOfOrder() {
 		return
 	}
 	bm.Hints = append(bm.Hints, CompactionHintFromOutOfOrder)
-	sort.Strings(bm.Hints)
+	slices.Sort(bm.Hints)
 }
 
 func (bm *BlockMetaCompaction) FromOutOfOrder() bool {
@@ -500,8 +500,8 @@ func (r blockIndexReader) SortedPostings(p index.Postings) index.Postings {
 	return r.ir.SortedPostings(p)
 }
 
-func (r blockIndexReader) Series(ref storage.SeriesRef, lset *labels.Labels, chks *[]chunks.Meta) error {
-	if err := r.ir.Series(ref, lset, chks); err != nil {
+func (r blockIndexReader) Series(ref storage.SeriesRef, builder *labels.ScratchBuilder, chks *[]chunks.Meta) error {
+	if err := r.ir.Series(ref, builder, chks); err != nil {
 		return errors.Wrapf(err, "block: %s", r.b.Meta().ULID)
 	}
 	return nil
@@ -562,12 +562,12 @@ func (pb *Block) Delete(mint, maxt int64, ms ...*labels.Matcher) error {
 	// Choose only valid postings which have chunks in the time-range.
 	stones := tombstones.NewMemTombstones()
 
-	var lset labels.Labels
 	var chks []chunks.Meta
+	var builder labels.ScratchBuilder
 
 Outer:
 	for p.Next() {
-		err := ir.Series(p.At(), &lset, &chks)
+		err := ir.Series(p.At(), &builder, &chks)
 		if err != nil {
 			return err
 		}

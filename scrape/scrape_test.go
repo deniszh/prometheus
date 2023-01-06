@@ -44,6 +44,7 @@ import (
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/util/teststorage"
 	"github.com/prometheus/prometheus/util/testutil"
 )
@@ -1019,6 +1020,51 @@ func TestScrapeLoopSeriesAdded(t *testing.T) {
 	require.Equal(t, 0, seriesAdded)
 }
 
+func TestScrapeLoopFailWithInvalidLabelsAfterRelabel(t *testing.T) {
+	s := teststorage.New(t)
+	defer s.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	target := &Target{
+		labels: labels.FromStrings("pod_label_invalid_012", "test"),
+	}
+	relabelConfig := []*relabel.Config{{
+		Action:      relabel.LabelMap,
+		Regex:       relabel.MustNewRegexp("pod_label_invalid_(.+)"),
+		Separator:   ";",
+		Replacement: "$1",
+	}}
+	sl := newScrapeLoop(ctx,
+		&testScraper{},
+		nil, nil,
+		func(l labels.Labels) labels.Labels {
+			return mutateSampleLabels(l, target, true, relabelConfig)
+		},
+		nopMutator,
+		s.Appender,
+		nil,
+		0,
+		true,
+		0,
+		nil,
+		0,
+		0,
+		false,
+		false,
+		nil,
+		false,
+	)
+
+	slApp := sl.appender(ctx)
+	total, added, seriesAdded, err := sl.append(slApp, []byte("test_metric 1\n"), "", time.Time{})
+	require.ErrorContains(t, err, "invalid metric name or label names")
+	require.NoError(t, slApp.Rollback())
+	require.Equal(t, 1, total)
+	require.Equal(t, 0, added)
+	require.Equal(t, 0, seriesAdded)
+}
+
 func makeTestMetrics(n int) []byte {
 	// Construct a metrics string to parse
 	sb := bytes.Buffer{}
@@ -1577,7 +1623,7 @@ func TestScrapeLoopAppendSampleLimit(t *testing.T) {
 		nil, nil, nil,
 		func(l labels.Labels) labels.Labels {
 			if l.Has("deleteme") {
-				return nil
+				return labels.EmptyLabels()
 			}
 			return l
 		},
@@ -2146,11 +2192,15 @@ func TestTargetScraperScrapeOK(t *testing.T) {
 		expectedTimeout = "1.5"
 	)
 
+	var protobufParsing bool
+
 	server := httptest.NewServer(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			accept := r.Header.Get("Accept")
-			if !strings.HasPrefix(accept, "application/openmetrics-text;") {
-				t.Errorf("Expected Accept header to prefer application/openmetrics-text, got %q", accept)
+			if protobufParsing {
+				accept := r.Header.Get("Accept")
+				if !strings.HasPrefix(accept, "application/vnd.google.protobuf;") {
+					t.Errorf("Expected Accept header to prefer application/vnd.google.protobuf, got %q", accept)
+				}
 			}
 
 			timeout := r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds")
@@ -2169,22 +2219,29 @@ func TestTargetScraperScrapeOK(t *testing.T) {
 		panic(err)
 	}
 
-	ts := &targetScraper{
-		Target: &Target{
-			labels: labels.FromStrings(
-				model.SchemeLabel, serverURL.Scheme,
-				model.AddressLabel, serverURL.Host,
-			),
-		},
-		client:  http.DefaultClient,
-		timeout: configTimeout,
-	}
-	var buf bytes.Buffer
+	runTest := func(acceptHeader string) {
+		ts := &targetScraper{
+			Target: &Target{
+				labels: labels.FromStrings(
+					model.SchemeLabel, serverURL.Scheme,
+					model.AddressLabel, serverURL.Host,
+				),
+			},
+			client:       http.DefaultClient,
+			timeout:      configTimeout,
+			acceptHeader: acceptHeader,
+		}
+		var buf bytes.Buffer
 
-	contentType, err := ts.scrape(context.Background(), &buf)
-	require.NoError(t, err)
-	require.Equal(t, "text/plain; version=0.0.4", contentType)
-	require.Equal(t, "metric_a 1\nmetric_b 2\n", buf.String())
+		contentType, err := ts.scrape(context.Background(), &buf)
+		require.NoError(t, err)
+		require.Equal(t, "text/plain; version=0.0.4", contentType)
+		require.Equal(t, "metric_a 1\nmetric_b 2\n", buf.String())
+	}
+
+	runTest(scrapeAcceptHeader)
+	protobufParsing = true
+	runTest(scrapeAcceptHeaderWithProtobuf)
 }
 
 func TestTargetScrapeScrapeCancel(t *testing.T) {
@@ -2209,7 +2266,8 @@ func TestTargetScrapeScrapeCancel(t *testing.T) {
 				model.AddressLabel, serverURL.Host,
 			),
 		},
-		client: http.DefaultClient,
+		client:       http.DefaultClient,
+		acceptHeader: scrapeAcceptHeader,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -2262,7 +2320,8 @@ func TestTargetScrapeScrapeNotFound(t *testing.T) {
 				model.AddressLabel, serverURL.Host,
 			),
 		},
-		client: http.DefaultClient,
+		client:       http.DefaultClient,
+		acceptHeader: scrapeAcceptHeader,
 	}
 
 	_, err = ts.scrape(context.Background(), io.Discard)
@@ -2304,6 +2363,7 @@ func TestTargetScraperBodySizeLimit(t *testing.T) {
 		},
 		client:        http.DefaultClient,
 		bodySizeLimit: bodySizeLimit,
+		acceptHeader:  scrapeAcceptHeader,
 	}
 	var buf bytes.Buffer
 
@@ -2899,8 +2959,8 @@ func TestScrapeReportSingleAppender(t *testing.T) {
 
 		c := 0
 		for series.Next() {
-			i := series.At().Iterator()
-			for i.Next() {
+			i := series.At().Iterator(nil)
+			for i.Next() != chunkenc.ValNone {
 				c++
 			}
 		}
@@ -2972,8 +3032,8 @@ func TestScrapeReportLimit(t *testing.T) {
 
 	var found bool
 	for series.Next() {
-		i := series.At().Iterator()
-		for i.Next() {
+		i := series.At().Iterator(nil)
+		for i.Next() == chunkenc.ValFloat {
 			_, v := i.At()
 			require.Equal(t, 1.0, v)
 			found = true

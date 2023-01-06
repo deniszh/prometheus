@@ -20,10 +20,13 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/model/timestamp"
+	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
@@ -96,7 +99,7 @@ func TestAlertingRuleLabelsUpdate(t *testing.T) {
 
 	results := []promql.Vector{
 		{
-			{
+			promql.Sample{
 				Metric: labels.FromStrings(
 					"__name__", "ALERTS",
 					"alertname", "HTTPRequestRateLow",
@@ -109,7 +112,7 @@ func TestAlertingRuleLabelsUpdate(t *testing.T) {
 			},
 		},
 		{
-			{
+			promql.Sample{
 				Metric: labels.FromStrings(
 					"__name__", "ALERTS",
 					"alertname", "HTTPRequestRateLow",
@@ -122,7 +125,7 @@ func TestAlertingRuleLabelsUpdate(t *testing.T) {
 			},
 		},
 		{
-			{
+			promql.Sample{
 				Metric: labels.FromStrings(
 					"__name__", "ALERTS",
 					"alertname", "HTTPRequestRateLow",
@@ -135,7 +138,7 @@ func TestAlertingRuleLabelsUpdate(t *testing.T) {
 			},
 		},
 		{
-			{
+			promql.Sample{
 				Metric: labels.FromStrings(
 					"__name__", "ALERTS",
 					"alertname", "HTTPRequestRateLow",
@@ -206,7 +209,7 @@ func TestAlertingRuleExternalLabelsInTemplate(t *testing.T) {
 		true, log.NewNopLogger(),
 	)
 	result := promql.Vector{
-		{
+		promql.Sample{
 			Metric: labels.FromStrings(
 				"__name__", "ALERTS",
 				"alertname", "ExternalLabelDoesNotExist",
@@ -217,7 +220,7 @@ func TestAlertingRuleExternalLabelsInTemplate(t *testing.T) {
 			),
 			Point: promql.Point{V: 1},
 		},
-		{
+		promql.Sample{
 			Metric: labels.FromStrings(
 				"__name__", "ALERTS",
 				"alertname", "ExternalLabelExists",
@@ -300,7 +303,7 @@ func TestAlertingRuleExternalURLInTemplate(t *testing.T) {
 		true, log.NewNopLogger(),
 	)
 	result := promql.Vector{
-		{
+		promql.Sample{
 			Metric: labels.FromStrings(
 				"__name__", "ALERTS",
 				"alertname", "ExternalURLDoesNotExist",
@@ -311,7 +314,7 @@ func TestAlertingRuleExternalURLInTemplate(t *testing.T) {
 			),
 			Point: promql.Point{V: 1},
 		},
-		{
+		promql.Sample{
 			Metric: labels.FromStrings(
 				"__name__", "ALERTS",
 				"alertname", "ExternalURLExists",
@@ -384,7 +387,7 @@ func TestAlertingRuleEmptyLabelFromTemplate(t *testing.T) {
 		true, log.NewNopLogger(),
 	)
 	result := promql.Vector{
-		{
+		promql.Sample{
 			Metric: labels.FromStrings(
 				"__name__", "ALERTS",
 				"alertname", "EmptyLabel",
@@ -658,4 +661,54 @@ func TestQueryForStateSeries(t *testing.T) {
 	for _, tst := range tests {
 		testFunc(tst)
 	}
+}
+
+// TestSendAlertsDontAffectActiveAlerts tests a fix for https://github.com/prometheus/prometheus/issues/11424.
+func TestSendAlertsDontAffectActiveAlerts(t *testing.T) {
+	rule := NewAlertingRule(
+		"TestRule",
+		nil,
+		time.Minute,
+		labels.FromStrings("severity", "critical"),
+		labels.EmptyLabels(), labels.EmptyLabels(), "", true, nil,
+	)
+
+	// Set an active alert.
+	lbls := labels.FromStrings("a1", "1")
+	h := lbls.Hash()
+	al := &Alert{State: StateFiring, Labels: lbls, ActiveAt: time.Now()}
+	rule.active[h] = al
+
+	expr, err := parser.ParseExpr("foo")
+	require.NoError(t, err)
+	rule.vector = expr
+
+	// The relabel rule reproduced the bug here.
+	opts := notifier.Options{
+		QueueCapacity: 1,
+		RelabelConfigs: []*relabel.Config{
+			{
+				SourceLabels: model.LabelNames{"a1"},
+				Regex:        relabel.MustNewRegexp("(.+)"),
+				TargetLabel:  "a1",
+				Replacement:  "bug",
+				Action:       "replace",
+			},
+		},
+	}
+	nm := notifier.NewManager(&opts, log.NewNopLogger())
+
+	f := SendAlerts(nm, "")
+	notifyFunc := func(ctx context.Context, expr string, alerts ...*Alert) {
+		require.Len(t, alerts, 1)
+		require.Equal(t, al, alerts[0])
+		f(ctx, expr, alerts...)
+	}
+
+	rule.sendAlerts(context.Background(), time.Now(), 0, 0, notifyFunc)
+	nm.Stop()
+
+	// The relabel rule changes a1=1 to a1=bug.
+	// But the labels with the AlertingRule should not be changed.
+	require.Equal(t, labels.FromStrings("a1", "1"), rule.active[h].Labels)
 }

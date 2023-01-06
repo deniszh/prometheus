@@ -237,9 +237,7 @@ foo_total 17.0 1520879607.789 # {xx="yy"} 5`
 			p.Metric(&res)
 			found := p.Exemplar(&e)
 			require.Equal(t, exp[i].m, string(m))
-			if e.HasTs {
-				require.Equal(t, exp[i].t, ts)
-			}
+			require.Equal(t, exp[i].t, ts)
 			require.Equal(t, exp[i].v, v)
 			require.Equal(t, exp[i].lset, res)
 			if exp[i].e == nil {
@@ -248,7 +246,6 @@ foo_total 17.0 1520879607.789 # {xx="yy"} 5`
 				require.Equal(t, true, found)
 				require.Equal(t, *exp[i].e, e)
 			}
-			res = res[:0]
 
 		case EntryType:
 			m, typ := p.Type()

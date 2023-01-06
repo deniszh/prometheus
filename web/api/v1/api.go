@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +41,7 @@ import (
 
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/textparse"
 	"github.com/prometheus/prometheus/model/timestamp"
@@ -85,6 +87,11 @@ type apiError struct {
 
 func (e *apiError) Error() string {
 	return fmt.Sprintf("%s: %s", e.typ, e.err)
+}
+
+// ScrapePoolsRetriever provide the list of all scrape pools.
+type ScrapePoolsRetriever interface {
+	ScrapePools() []string
 }
 
 // TargetRetriever provides the list of active/dropped targets to scrape or not.
@@ -178,6 +185,7 @@ type API struct {
 	QueryEngine       QueryEngine
 	ExemplarQueryable storage.ExemplarQueryable
 
+	scrapePoolsRetriever  func(context.Context) ScrapePoolsRetriever
 	targetRetriever       func(context.Context) TargetRetriever
 	alertmanagerRetriever func(context.Context) AlertmanagerRetriever
 	rulesRetriever        func(context.Context) RulesRetriever
@@ -203,6 +211,8 @@ type API struct {
 }
 
 func init() {
+	jsoniter.RegisterTypeEncoderFunc("promql.Series", marshalSeriesJSON, marshalSeriesJSONIsEmpty)
+	jsoniter.RegisterTypeEncoderFunc("promql.Sample", marshalSampleJSON, marshalSampleJSONIsEmpty)
 	jsoniter.RegisterTypeEncoderFunc("promql.Point", marshalPointJSON, marshalPointJSONIsEmpty)
 	jsoniter.RegisterTypeEncoderFunc("exemplar.Exemplar", marshalExemplarJSON, marshalExemplarJSONEmpty)
 }
@@ -213,6 +223,7 @@ func NewAPI(
 	q storage.SampleAndChunkQueryable,
 	ap storage.Appendable,
 	eq storage.ExemplarQueryable,
+	spsr func(context.Context) ScrapePoolsRetriever,
 	tr func(context.Context) TargetRetriever,
 	ar func(context.Context) AlertmanagerRetriever,
 	configFunc func() config.Config,
@@ -240,6 +251,7 @@ func NewAPI(
 		Queryable:         q,
 		ExemplarQueryable: eq,
 
+		scrapePoolsRetriever:  spsr,
 		targetRetriever:       tr,
 		alertmanagerRetriever: ar,
 
@@ -335,6 +347,7 @@ func (api *API) Register(r *route.Router) {
 	r.Post("/series", wrapAgent(api.series))
 	r.Del("/series", wrapAgent(api.dropSeries))
 
+	r.Get("/scrape_pools", wrap(api.scrapePools))
 	r.Get("/targets", wrap(api.targets))
 	r.Get("/targets/metadata", wrap(api.targetMetadata))
 	r.Get("/alertmanagers", wrapAgent(api.alertmanagers))
@@ -550,12 +563,12 @@ func (api *API) queryExemplars(r *http.Request) apiFuncResult {
 	ctx := r.Context()
 	eq, err := api.ExemplarQueryable.ExemplarQuerier(ctx)
 	if err != nil {
-		return apiFuncResult{nil, &apiError{errorExec, err}, nil, nil}
+		return apiFuncResult{nil, returnAPIError(err), nil, nil}
 	}
 
 	res, err := eq.Select(timestamp.FromTime(start), timestamp.FromTime(end), selectors...)
 	if err != nil {
-		return apiFuncResult{nil, &apiError{errorExec, err}, nil, nil}
+		return apiFuncResult{nil, returnAPIError(err), nil, nil}
 	}
 
 	return apiFuncResult{res, nil, nil, nil}
@@ -600,7 +613,7 @@ func (api *API) labelNames(r *http.Request) apiFuncResult {
 
 	q, err := api.Queryable.Querier(r.Context(), timestamp.FromTime(start), timestamp.FromTime(end))
 	if err != nil {
-		return apiFuncResult{nil, &apiError{errorExec, err}, nil, nil}
+		return apiFuncResult{nil, returnAPIError(err), nil, nil}
 	}
 	defer q.Close()
 
@@ -614,7 +627,7 @@ func (api *API) labelNames(r *http.Request) apiFuncResult {
 		for _, matchers := range matcherSets {
 			vals, callWarnings, err := q.LabelNames(matchers...)
 			if err != nil {
-				return apiFuncResult{nil, &apiError{errorExec, err}, warnings, nil}
+				return apiFuncResult{nil, returnAPIError(err), warnings, nil}
 			}
 
 			warnings = append(warnings, callWarnings...)
@@ -750,7 +763,7 @@ func (api *API) series(r *http.Request) (result apiFuncResult) {
 
 	q, err := api.Queryable.Querier(r.Context(), timestamp.FromTime(start), timestamp.FromTime(end))
 	if err != nil {
-		return apiFuncResult{nil, &apiError{errorExec, err}, nil, nil}
+		return apiFuncResult{nil, returnAPIError(err), nil, nil}
 	}
 	// From now on, we must only return with a finalizer in the result (to
 	// be called by the caller) or call q.Close ourselves (which is required
@@ -791,7 +804,7 @@ func (api *API) series(r *http.Request) (result apiFuncResult) {
 
 	warnings := set.Warnings()
 	if set.Err() != nil {
-		return apiFuncResult{nil, &apiError{errorExec, set.Err()}, warnings, closer}
+		return apiFuncResult{nil, returnAPIError(set.Err()), warnings, closer}
 	}
 
 	return apiFuncResult{metrics, nil, warnings, closer}
@@ -819,6 +832,10 @@ type Target struct {
 
 	ScrapeInterval string `json:"scrapeInterval"`
 	ScrapeTimeout  string `json:"scrapeTimeout"`
+}
+
+type ScrapePoolsDiscovery struct {
+	ScrapePools []string `json:"scrapePools"`
 }
 
 // DroppedTarget has the information for one target that was dropped during relabelling.
@@ -900,6 +917,13 @@ func getGlobalURL(u *url.URL, opts GlobalURLOptions) (*url.URL, error) {
 	return u, nil
 }
 
+func (api *API) scrapePools(r *http.Request) apiFuncResult {
+	names := api.scrapePoolsRetriever(r.Context()).ScrapePools()
+	sort.Strings(names)
+	res := &ScrapePoolsDiscovery{ScrapePools: names}
+	return apiFuncResult{data: res, err: nil, warnings: nil, finalizer: nil}
+}
+
 func (api *API) targets(r *http.Request) apiFuncResult {
 	sortKeys := func(targets map[string][]*scrape.Target) ([]string, int) {
 		var n int
@@ -912,15 +936,7 @@ func (api *API) targets(r *http.Request) apiFuncResult {
 		return keys, n
 	}
 
-	flatten := func(targets map[string][]*scrape.Target) []*scrape.Target {
-		keys, n := sortKeys(targets)
-		res := make([]*scrape.Target, 0, n)
-		for _, k := range keys {
-			res = append(res, targets[k]...)
-		}
-		return res
-	}
-
+	scrapePool := r.URL.Query().Get("scrapePool")
 	state := strings.ToLower(r.URL.Query().Get("state"))
 	showActive := state == "" || state == "any" || state == "active"
 	showDropped := state == "" || state == "any" || state == "dropped"
@@ -932,6 +948,9 @@ func (api *API) targets(r *http.Request) apiFuncResult {
 		res.ActiveTargets = make([]*Target, 0, numTargets)
 
 		for _, key := range activeKeys {
+			if scrapePool != "" && key != scrapePool {
+				continue
+			}
 			for _, target := range targetsActive[key] {
 				lastErrStr := ""
 				lastErr := target.LastError()
@@ -967,12 +986,18 @@ func (api *API) targets(r *http.Request) apiFuncResult {
 		res.ActiveTargets = []*Target{}
 	}
 	if showDropped {
-		tDropped := flatten(api.targetRetriever(r.Context()).TargetsDropped())
-		res.DroppedTargets = make([]*DroppedTarget, 0, len(tDropped))
-		for _, t := range tDropped {
-			res.DroppedTargets = append(res.DroppedTargets, &DroppedTarget{
-				DiscoveredLabels: t.DiscoveredLabels().Map(),
-			})
+		targetsDropped := api.targetRetriever(r.Context()).TargetsDropped()
+		droppedKeys, numTargets := sortKeys(targetsDropped)
+		res.DroppedTargets = make([]*DroppedTarget, 0, numTargets)
+		for _, key := range droppedKeys {
+			if scrapePool != "" && key != scrapePool {
+				continue
+			}
+			for _, target := range targetsDropped[key] {
+				res.DroppedTargets = append(res.DroppedTargets, &DroppedTarget{
+					DiscoveredLabels: target.DiscoveredLabels().Map(),
+				})
+			}
 		}
 	} else {
 		res.DroppedTargets = []*DroppedTarget{}
@@ -1656,18 +1681,211 @@ OUTER:
 	return matcherSets, nil
 }
 
+// marshalSeriesJSON writes something like the following:
+//
+//	{
+//	   "metric" : {
+//	      "__name__" : "up",
+//	      "job" : "prometheus",
+//	      "instance" : "localhost:9090"
+//	   },
+//	   "values": [
+//	      [ 1435781451.781, "1" ],
+//	      < more values>
+//	   ],
+//	   "histograms": [
+//	      [ 1435781451.781, { < histogram, see below > } ],
+//	      < more histograms >
+//	   ],
+//	},
+func marshalSeriesJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
+	s := *((*promql.Series)(ptr))
+	stream.WriteObjectStart()
+	stream.WriteObjectField(`metric`)
+	m, err := s.Metric.MarshalJSON()
+	if err != nil {
+		stream.Error = err
+		return
+	}
+	stream.SetBuffer(append(stream.Buffer(), m...))
+
+	// We make two passes through the series here: In the first marshaling
+	// all value points, in the second marshaling all histogram
+	// points. That's probably cheaper than just one pass in which we copy
+	// out histogram Points into a newly allocated slice for separate
+	// marshaling. (Could be benchmarked, though.)
+	var foundValue, foundHistogram bool
+	for _, p := range s.Points {
+		if p.H == nil {
+			stream.WriteMore()
+			if !foundValue {
+				stream.WriteObjectField(`values`)
+				stream.WriteArrayStart()
+			}
+			foundValue = true
+			marshalPointJSON(unsafe.Pointer(&p), stream)
+		} else {
+			foundHistogram = true
+		}
+	}
+	if foundValue {
+		stream.WriteArrayEnd()
+	}
+	if foundHistogram {
+		firstHistogram := true
+		for _, p := range s.Points {
+			if p.H != nil {
+				stream.WriteMore()
+				if firstHistogram {
+					stream.WriteObjectField(`histograms`)
+					stream.WriteArrayStart()
+				}
+				firstHistogram = false
+				marshalPointJSON(unsafe.Pointer(&p), stream)
+			}
+		}
+		stream.WriteArrayEnd()
+	}
+	stream.WriteObjectEnd()
+}
+
+func marshalSeriesJSONIsEmpty(ptr unsafe.Pointer) bool {
+	return false
+}
+
+// marshalSampleJSON writes something like the following for normal value samples:
+//
+//	{
+//	   "metric" : {
+//	      "__name__" : "up",
+//	      "job" : "prometheus",
+//	      "instance" : "localhost:9090"
+//	   },
+//	   "value": [ 1435781451.781, "1" ]
+//	},
+//
+// For histogram samples, it writes something like this:
+//
+//	{
+//	   "metric" : {
+//	      "__name__" : "up",
+//	      "job" : "prometheus",
+//	      "instance" : "localhost:9090"
+//	   },
+//	   "histogram": [ 1435781451.781, { < histogram, see below > } ]
+//	},
+func marshalSampleJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
+	s := *((*promql.Sample)(ptr))
+	stream.WriteObjectStart()
+	stream.WriteObjectField(`metric`)
+	m, err := s.Metric.MarshalJSON()
+	if err != nil {
+		stream.Error = err
+		return
+	}
+	stream.SetBuffer(append(stream.Buffer(), m...))
+	stream.WriteMore()
+	if s.Point.H == nil {
+		stream.WriteObjectField(`value`)
+	} else {
+		stream.WriteObjectField(`histogram`)
+	}
+	marshalPointJSON(unsafe.Pointer(&s.Point), stream)
+	stream.WriteObjectEnd()
+}
+
+func marshalSampleJSONIsEmpty(ptr unsafe.Pointer) bool {
+	return false
+}
+
 // marshalPointJSON writes `[ts, "val"]`.
 func marshalPointJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
 	p := *((*promql.Point)(ptr))
 	stream.WriteArrayStart()
 	jsonutil.MarshalTimestamp(p.T, stream)
 	stream.WriteMore()
-	jsonutil.MarshalValue(p.V, stream)
+	if p.H == nil {
+		jsonutil.MarshalValue(p.V, stream)
+	} else {
+		marshalHistogram(p.H, stream)
+	}
 	stream.WriteArrayEnd()
 }
 
 func marshalPointJSONIsEmpty(ptr unsafe.Pointer) bool {
 	return false
+}
+
+// marshalHistogramJSON writes something like:
+//
+//	{
+//	    "count": "42",
+//	    "sum": "34593.34",
+//	    "buckets": [
+//	      [ 3, "-0.25", "0.25", "3"],
+//	      [ 0, "0.25", "0.5", "12"],
+//	      [ 0, "0.5", "1", "21"],
+//	      [ 0, "2", "4", "6"]
+//	    ]
+//	}
+//
+// The 1st element in each bucket array determines if the boundaries are
+// inclusive (AKA closed) or exclusive (AKA open):
+//
+//	0: lower exclusive, upper inclusive
+//	1: lower inclusive, upper exclusive
+//	2: both exclusive
+//	3: both inclusive
+//
+// The 2nd and 3rd elements are the lower and upper boundary. The 4th element is
+// the bucket count.
+func marshalHistogram(h *histogram.FloatHistogram, stream *jsoniter.Stream) {
+	stream.WriteObjectStart()
+	stream.WriteObjectField(`count`)
+	jsonutil.MarshalValue(h.Count, stream)
+	stream.WriteMore()
+	stream.WriteObjectField(`sum`)
+	jsonutil.MarshalValue(h.Sum, stream)
+
+	bucketFound := false
+	it := h.AllBucketIterator()
+	for it.Next() {
+		bucket := it.At()
+		if bucket.Count == 0 {
+			continue // No need to expose empty buckets in JSON.
+		}
+		stream.WriteMore()
+		if !bucketFound {
+			stream.WriteObjectField(`buckets`)
+			stream.WriteArrayStart()
+		}
+		bucketFound = true
+		boundaries := 2 // Exclusive on both sides AKA open interval.
+		if bucket.LowerInclusive {
+			if bucket.UpperInclusive {
+				boundaries = 3 // Inclusive on both sides AKA closed interval.
+			} else {
+				boundaries = 1 // Inclusive only on lower end AKA right open.
+			}
+		} else {
+			if bucket.UpperInclusive {
+				boundaries = 0 // Inclusive only on upper end AKA left open.
+			}
+		}
+		stream.WriteArrayStart()
+		stream.WriteInt(boundaries)
+		stream.WriteMore()
+		jsonutil.MarshalValue(bucket.Lower, stream)
+		stream.WriteMore()
+		jsonutil.MarshalValue(bucket.Upper, stream)
+		stream.WriteMore()
+		jsonutil.MarshalValue(bucket.Count, stream)
+		stream.WriteArrayEnd()
+	}
+	if bucketFound {
+		stream.WriteArrayEnd()
+	}
+	stream.WriteObjectEnd()
 }
 
 // marshalExemplarJSON writes.

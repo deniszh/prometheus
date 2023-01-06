@@ -148,14 +148,14 @@ func (h *headIndexReader) SortedPostings(p index.Postings) index.Postings {
 }
 
 // Series returns the series for the given reference.
-func (h *headIndexReader) Series(ref storage.SeriesRef, lbls *labels.Labels, chks *[]chunks.Meta) error {
+func (h *headIndexReader) Series(ref storage.SeriesRef, builder *labels.ScratchBuilder, chks *[]chunks.Meta) error {
 	s := h.head.series.getByID(chunks.HeadSeriesRef(ref))
 
 	if s == nil {
 		h.head.metrics.seriesNotFound.Inc()
 		return storage.ErrNotFound
 	}
-	*lbls = append((*lbls)[:0], s.lset...)
+	builder.Assign(s.lset)
 
 	s.Lock()
 	defer s.Unlock()
@@ -222,9 +222,9 @@ func (h *headIndexReader) LabelNamesFor(ids ...storage.SeriesRef) ([]string, err
 		if memSeries == nil {
 			return nil, storage.ErrNotFound
 		}
-		for _, lbl := range memSeries.lset {
+		memSeries.lset.Range(func(lbl labels.Label) {
 			namesMap[lbl.Name] = struct{}{}
-		}
+		})
 	}
 	names := make([]string, 0, len(namesMap))
 	for name := range namesMap {
@@ -486,7 +486,7 @@ func (o mergedOOOChunks) Bytes() []byte {
 		panic(err)
 	}
 	it := o.Iterator(nil)
-	for it.Next() {
+	for it.Next() == chunkenc.ValFloat {
 		t, v := it.At()
 		app.Append(t, v)
 	}
@@ -503,11 +503,7 @@ func (o mergedOOOChunks) Appender() (chunkenc.Appender, error) {
 }
 
 func (o mergedOOOChunks) Iterator(iterator chunkenc.Iterator) chunkenc.Iterator {
-	iterators := make([]chunkenc.Iterator, 0, len(o.chunks))
-	for _, c := range o.chunks {
-		iterators = append(iterators, c.Chunk.Iterator(nil))
-	}
-	return storage.NewChainSampleIterator(iterators)
+	return storage.ChainSampleIteratorFromMetas(iterator, o.chunks)
 }
 
 func (o mergedOOOChunks) NumSamples() int {
@@ -535,7 +531,7 @@ func (b boundedChunk) Bytes() []byte {
 	xor := chunkenc.NewXORChunk()
 	a, _ := xor.Appender()
 	it := b.Iterator(nil)
-	for it.Next() {
+	for it.Next() == chunkenc.ValFloat {
 		t, v := it.At()
 		a.Append(t, v)
 	}
@@ -564,33 +560,35 @@ type boundedIterator struct {
 // until its able to find a sample within the bounds minT and maxT.
 // If there are samples within bounds it will advance one by one amongst them.
 // If there are no samples within bounds it will return false.
-func (b boundedIterator) Next() bool {
-	for b.Iterator.Next() {
+func (b boundedIterator) Next() chunkenc.ValueType {
+	for b.Iterator.Next() == chunkenc.ValFloat {
 		t, _ := b.Iterator.At()
 		if t < b.minT {
 			continue
 		} else if t > b.maxT {
-			return false
+			return chunkenc.ValNone
 		}
-		return true
+		return chunkenc.ValFloat
 	}
-	return false
+	return chunkenc.ValNone
 }
 
-func (b boundedIterator) Seek(t int64) bool {
+func (b boundedIterator) Seek(t int64) chunkenc.ValueType {
 	if t < b.minT {
 		// We must seek at least up to b.minT if it is asked for something before that.
-		ok := b.Iterator.Seek(b.minT)
-		if !ok {
-			return false
+		val := b.Iterator.Seek(b.minT)
+		if !(val == chunkenc.ValFloat) {
+			return chunkenc.ValNone
 		}
 		t, _ := b.Iterator.At()
-		return t <= b.maxT
+		if t <= b.maxT {
+			return chunkenc.ValFloat
+		}
 	}
 	if t > b.maxT {
 		// We seek anyway so that the subsequent Next() calls will also return false.
 		b.Iterator.Seek(t)
-		return false
+		return chunkenc.ValNone
 	}
 	return b.Iterator.Seek(t)
 }
@@ -684,21 +682,6 @@ func (s *memSeries) iterator(id chunks.HeadChunkID, isoState *isolationState, ch
 	return makeStopIterator(c.chunk, it, stopAfter)
 }
 
-func makeStopIterator(c chunkenc.Chunk, it chunkenc.Iterator, stopAfter int) chunkenc.Iterator {
-	// Re-use the Iterator object if it is a stopIterator.
-	if stopIter, ok := it.(*stopIterator); ok {
-		stopIter.Iterator = c.Iterator(stopIter.Iterator)
-		stopIter.i = -1
-		stopIter.stopAfter = stopAfter
-		return stopIter
-	}
-	return &stopIterator{
-		Iterator:  c.Iterator(it),
-		i:         -1,
-		stopAfter: stopAfter,
-	}
-}
-
 // stopIterator wraps an Iterator, but only returns the first
 // stopAfter values, if initialized with i=-1.
 type stopIterator struct {
@@ -707,10 +690,26 @@ type stopIterator struct {
 	i, stopAfter int
 }
 
-func (it *stopIterator) Next() bool {
+func (it *stopIterator) Next() chunkenc.ValueType {
 	if it.i+1 >= it.stopAfter {
-		return false
+		return chunkenc.ValNone
 	}
 	it.i++
 	return it.Iterator.Next()
+}
+
+func makeStopIterator(c chunkenc.Chunk, it chunkenc.Iterator, stopAfter int) chunkenc.Iterator {
+	// Re-use the Iterator object if it is a stopIterator.
+	if stopIter, ok := it.(*stopIterator); ok {
+		stopIter.Iterator = c.Iterator(stopIter.Iterator)
+		stopIter.i = -1
+		stopIter.stopAfter = stopAfter
+		return stopIter
+	}
+
+	return &stopIterator{
+		Iterator:  c.Iterator(it),
+		i:         -1,
+		stopAfter: stopAfter,
+	}
 }

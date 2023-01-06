@@ -284,8 +284,8 @@ func (tg *testGroup) test(evalInterval time.Duration, groupOrderMap map[string]i
 					for _, a := range ar.ActiveAlerts() {
 						if a.State == rules.StateFiring {
 							alerts = append(alerts, labelAndAnnotation{
-								Labels:      append(labels.Labels{}, a.Labels...),
-								Annotations: append(labels.Labels{}, a.Annotations...),
+								Labels:      a.Labels.Copy(),
+								Annotations: a.Annotations.Copy(),
 							})
 						}
 					}
@@ -447,7 +447,7 @@ func query(ctx context.Context, qs string, t time.Time, engine *promql.Engine, q
 		return v, nil
 	case promql.Scalar:
 		return promql.Vector{promql.Sample{
-			Point:  promql.Point(v),
+			Point:  promql.Point{T: v.T, V: v.V},
 			Metric: labels.Labels{},
 		}}, nil
 	default:
