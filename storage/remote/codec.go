@@ -572,8 +572,7 @@ func NewChunkedSeriesSet(chunkedReader *ChunkedReader, respBody io.ReadCloser, m
 func (s *chunkedSeriesSet) Next() bool {
 	res := &prompb.ChunkedReadResponse{}
 
-	err := s.chunkedReader.NextProto(res)
-	if err != nil {
+	if err := s.chunkedReader.NextProto(res); err != nil {
 		if !errors.Is(err, io.EOF) {
 			s.err = err
 			_, _ = io.Copy(io.Discard, s.respBody)
